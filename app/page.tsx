@@ -3,7 +3,7 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
 import * as XLSX from 'xlsx'
 
-const HIDDEN_COLUMNS = new Set(['Open origin', 'Close origin', 'SL', 'TP', 'Margin', 'Comment', '_openDisplay', '_closeDisplay'])
+const HIDDEN_COLUMNS = new Set(['Open origin', 'Close origin', 'SL', 'TP', 'Margin', 'Comment', '_openDisplay', '_closeDisplay', 'Position', 'Open price', 'Close price', 'Commission', 'Swap', 'Rollover'])
 
 type TradeRow = Record<string, any>
 
@@ -11,9 +11,12 @@ function formatCZK(value: number) {
   return new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: 'CZK', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(value)
 }
 
+const CACHE_VERSION = 3
+
 export default function Home() {
   const [fileName, setFileName]         = useState('')
   const [rows, setRows]                 = useState<TradeRow[]>([])
+  const [openRows, setOpenRows]           = useState<TradeRow[]>([])
   const [error, setError]               = useState('')
   const [page, setPage]                 = useState(0)
   const [loading, setLoading]           = useState(false)
@@ -22,26 +25,51 @@ export default function Home() {
   const [selectedYear, setSelectedYear] = useState<number>(0)
   const [sortKey, setSortKey]           = useState<string>('')
   const [sortDir, setSortDir]           = useState<'asc' | 'desc'>('asc')
+  const [openSortKey, setOpenSortKey]   = useState<string>('')
+  const [openSortDir, setOpenSortDir]   = useState<'asc' | 'desc'>('asc')
   const [lastImported, setLastImported] = useState<string>('')
+  const [todayFx, setTodayFx]             = useState<number>(0)
   const [restored, setRestored]         = useState(false)
   const [activeView, setActiveView]     = useState<string>('overview')
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Fetch today's EUR/CZK rate when open positions are loaded
+  useEffect(() => {
+    if (!openRows.length) return
+    const today = new Date()
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`
+    fetchFx(todayStr).then(rate => { if (rate) setTodayFx(rate as number) })
+  }, [openRows])
+
+  // Persist selectedYear whenever it changes
+  useEffect(() => {
+    if (!selectedYear) return
+    localStorage.setItem('xtb_selected_year', String(selectedYear))
+  }, [selectedYear])
 
   // Restore persisted data on mount
   useEffect(() => {
     try {
       const saved = localStorage.getItem('xtb_cache')
       if (saved) {
-        const { fileName: fn, rows: r, fxWarnings: w, lastImported: li } = JSON.parse(saved)
+        const parsed = JSON.parse(saved)
+        if (parsed.version !== CACHE_VERSION) { localStorage.removeItem('xtb_cache'); return }
+        const { fileName: fn, rows: r, openRows: or, fxWarnings: w, lastImported: li } = parsed
         if (fn && Array.isArray(r) && r.length > 0) {
           setFileName(fn)
           setRows(r)
+          setOpenRows(or ?? [])
           setFxWarnings(w ?? [])
           setLastImported(li ?? '')
           setRestored(true)
-          // Default to latest year on restore
-          const restoredYears = [...new Set((r as TradeRow[]).map((row: TradeRow) => row['_closeYear']).filter(Boolean) as number[])].sort((a: number, b: number) => b - a)
-          setSelectedYear(restoredYears[0] ?? 0)
+          // Restore selected year from its own key
+          const savedYear = localStorage.getItem('xtb_selected_year')
+          if (savedYear && Number(savedYear) > 0) {
+            setSelectedYear(Number(savedYear))
+          } else {
+            const restoredYears = [...new Set((r as TradeRow[]).map((row: TradeRow) => row['_closeYear']).filter(Boolean) as number[])].sort((a: number, b: number) => b - a)
+            setSelectedYear(restoredYears[0] ?? 0)
+          }
         }
       }
     } catch { /* ignore corrupt cache */ }
@@ -110,6 +138,7 @@ export default function Home() {
     setLoadingMsg('Reading file…')
     setFileName(file.name)
     setRows([])
+    setOpenRows([])
     setError('')
     setFxWarnings([])
     setSelectedYear(0)
@@ -185,8 +214,82 @@ export default function Home() {
           setFxWarnings([...missingFxDates].sort())
         }
 
+        // ── Parse open positions sheet ──
+        let outerOpenJson: TradeRow[] = []
+        const openSheetName = workbook.SheetNames.find(n => n.toUpperCase().startsWith('OPEN POSITION'))
+        if (openSheetName) {
+          const openSheet = workbook.Sheets[openSheetName]
+          const openRaw = XLSX.utils.sheet_to_json(openSheet, { header: 1, defval: '' }) as any[][]
+
+          // Find header row
+          const OPEN_KNOWN = new Set(['Symbol', 'Open time', 'Volume', 'Open price'])
+          const openHeaderIdx = openRaw.findIndex(row =>
+            Array.isArray(row) && row.filter(c => OPEN_KNOWN.has(String(c).trim())).length >= 3
+          )
+
+          if (openHeaderIdx !== -1) {
+            const openHeaders = openRaw[openHeaderIdx] as string[]
+            const openDataRows = openRaw.slice(openHeaderIdx + 1).filter(r => {
+              const hasData = r.some((c: any) => c !== '' && c !== null && c !== undefined)
+              const firstNonEmpty = r.find((c: any) => c !== '' && c !== null && c !== undefined)
+              const firstStr = String(firstNonEmpty ?? '').toLowerCase().trim()
+              return hasData && firstStr !== 'total'
+            })
+
+            // Detect column offset — XTB open positions have a leading empty col in data rows
+            const firstData = openDataRows[0] ?? []
+            const offset = (firstData[0] === '' || firstData[0] === null || firstData[0] === undefined) ? 1 : 0
+
+            const now = new Date()
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()) // date only, no time
+            const openJson = openDataRows.map(row => {
+              const obj: TradeRow = {}
+              openHeaders.forEach((h, i) => { obj[h] = row[i + offset] })
+
+              // Format open time display
+              obj['_openDisplay'] = formatExcelDate(obj['Open time'])
+
+              // Days held (open date to today)
+              const openApiDate = excelDateToApiDate(obj['Open time'])
+              obj['_openApiDate'] = openApiDate
+              if (openApiDate) {
+                const openDateObj = new Date(openApiDate) // already midnight since from YYYY-MM-DD string
+                const diffMs = today.getTime() - openDateObj.getTime()
+                obj['Days held'] = Math.round(diffMs / (1000 * 60 * 60 * 24))
+              } else {
+                obj['Days held'] = ''
+              }
+
+              // Tax exemption — based on open date vs today (3-year rule)
+              if (openApiDate) {
+                const openDateObj = new Date(openApiDate)
+                const threeYearsLater = new Date(openDateObj.getFullYear() + 3, openDateObj.getMonth(), openDateObj.getDate() + 1)
+                if (today >= threeYearsLater) {
+                  obj['Tax exempt'] = 'Yes'
+                  obj['Days to exempt'] = 0
+                } else {
+                  obj['Tax exempt'] = 'No'
+                  obj['Days to exempt'] = Math.round((threeYearsLater.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
+                }
+              }
+
+              return obj
+            })
+
+            // Clean up internal date key
+            for (const obj of openJson) {
+              delete obj['_openApiDate']
+            }
+
+            setOpenRows(openJson)
+            outerOpenJson = openJson
+          }
+        }
+
         setSortKey('')
         setSortDir('asc')
+        setOpenSortKey('')
+        setOpenSortDir('asc')
         // Default to latest year (availableYears is sorted desc so first unique close year)
         const years = [...new Set(json.map((r: TradeRow) => r['_closeYear']).filter(Boolean) as number[])].sort((a, b) => b - a)
         setSelectedYear(years[0] ?? 0)
@@ -194,12 +297,16 @@ export default function Home() {
         // Persist to localStorage — catch quota errors gracefully
         const importedAt = new Date().toLocaleString('cs-CZ')
         try {
+          const latestYear = years[0] ?? 0
           localStorage.setItem('xtb_cache', JSON.stringify({
+            version: CACHE_VERSION,
             fileName: file.name,
             rows: json,
+            openRows: outerOpenJson,
             fxWarnings: [...missingFxDates].sort(),
             lastImported: importedAt
           }))
+          localStorage.setItem('xtb_selected_year', String(latestYear))
         } catch (e) {
           console.warn('localStorage quota exceeded — data not cached', e)
         }
@@ -246,10 +353,21 @@ export default function Home() {
     })
   }, [filteredRows, sortKey, sortDir])
 
+  const sortedOpenRows = useMemo(() => {
+    if (!openSortKey) return openRows
+    return [...openRows].sort((a, b) => {
+      const av = a[openSortKey], bv = b[openSortKey]
+      const aNum = Number(av), bNum = Number(bv)
+      const bothNumbers = !isNaN(aNum) && !isNaN(bNum)
+      const result = bothNumbers ? aNum - bNum : String(av ?? '').localeCompare(String(bv ?? ''))
+      return openSortDir === 'asc' ? result : -result
+    })
+  }, [openRows, openSortKey, openSortDir])
+
   const {
     totalPurchaseCZK, exemptPurchaseCZK, taxablePurchaseCZK,
     totalSaleCZK, exemptSaleCZK, taxableSaleCZK,
-    taxBase, mustDeclare
+    taxBase, mustDeclare, taxOwed
   } = useMemo(() => {
     let totalPurchaseCZK = 0, exemptPurchaseCZK = 0, taxablePurchaseCZK = 0
     let totalSaleCZK = 0, exemptSaleCZK = 0, taxableSaleCZK = 0
@@ -261,8 +379,9 @@ export default function Home() {
       else                              { taxablePurchaseCZK += p; taxableSaleCZK += s }
     }
     const taxBase = Math.max(0, taxableSaleCZK - taxablePurchaseCZK)
-    const mustDeclare = totalSaleCZK > 99999 && taxBase > 0
-    return { totalPurchaseCZK, exemptPurchaseCZK, taxablePurchaseCZK, totalSaleCZK, exemptSaleCZK, taxableSaleCZK, taxBase, mustDeclare }
+    const mustDeclare = totalSaleCZK > 100000
+    const taxOwed = mustDeclare && taxBase > 0
+    return { taxOwed, totalPurchaseCZK, exemptPurchaseCZK, taxablePurchaseCZK, totalSaleCZK, exemptSaleCZK, taxableSaleCZK, taxBase, mustDeclare }
   }, [filteredRows])
 
   const symbolPivot = useMemo(() => {
@@ -376,7 +495,24 @@ export default function Home() {
 
         /* ── Empty state ── */
         .empty-wrap { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:calc(100vh - 56px); gap:20px; animation:fadeIn 0.6s ease both; }
-        .empty-icon-ring { width:72px; height:72px; border-radius:50%; border:1px solid rgba(78,143,255,0.2); display:flex; align-items:center; justify-content:center; animation:pulse-ring 2.5s ease-in-out infinite; margin-bottom:4px; }
+        .empty-icon-ring {
+          width: 88px; height: 88px;
+          border-radius: 50%;
+          border: 1px solid rgba(78,143,255,0.25);
+          display: flex; align-items: center; justify-content: center;
+          animation: pulse-ring 2.5s ease-in-out infinite;
+          margin-bottom: 4px;
+          cursor: pointer;
+          transition: border-color 0.2s, background 0.2s, box-shadow 0.2s, transform 0.15s;
+          background: rgba(78,143,255,0.04);
+        }
+        .empty-icon-ring:hover {
+          border-color: rgba(78,143,255,0.6);
+          background: rgba(78,143,255,0.1);
+          box-shadow: 0 0 0 6px rgba(78,143,255,0.08);
+          transform: scale(1.05);
+          animation: none;
+        }
         .empty-title { font-size:15px; font-weight:600; color:var(--text-1); letter-spacing:0.04em; }
         .empty-sub { font-size:12px; color:var(--text-3); letter-spacing:0.04em; margin-top:-8px; }
 
@@ -472,7 +608,7 @@ export default function Home() {
         .pivot-topbar-left { display:flex; align-items:center; gap:10px; }
         .pivot-label { font-size:10px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-3); }
         .pivot-count { font-family:var(--mono); font-size:11px; color:var(--accent); background:rgba(106,163,255,0.08); border:1px solid rgba(106,163,255,0.15); border-radius:4px; padding:2px 8px; }
-        .pivot-scroll { overflow-y:auto; max-height:480px; }
+        .pivot-scroll { overflow-y:auto; }
         .pivot-table { width:100%; border-collapse:collapse; }
         .pivot-table thead th { position:sticky; top:0; background:rgba(0,0,0,0.35); font-family:'Syne',sans-serif; font-size:10px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--text-3); padding:9px 16px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); user-select:none; z-index:1; }
         .pivot-table thead th:first-child { text-align:left; }
@@ -487,13 +623,8 @@ export default function Home() {
         .pnl-neg { color:var(--red); }
         .pnl-zero { color:var(--text-3); }
 
-        /* ── Custom scrollbars ── */
-        .pivot-scroll, .table-scroll { scrollbar-width:thin; scrollbar-color:rgba(106,163,255,0.2) transparent; }
-        .pivot-scroll::-webkit-scrollbar, .table-scroll::-webkit-scrollbar { width:5px; height:5px; }
-        .pivot-scroll::-webkit-scrollbar-track, .table-scroll::-webkit-scrollbar-track { background:transparent; }
-        .pivot-scroll::-webkit-scrollbar-thumb, .table-scroll::-webkit-scrollbar-thumb { background:rgba(106,163,255,0.18); border-radius:99px; }
-        .pivot-scroll::-webkit-scrollbar-thumb:hover, .table-scroll::-webkit-scrollbar-thumb:hover { background:rgba(106,163,255,0.35); }
-        .pivot-scroll::-webkit-scrollbar-corner, .table-scroll::-webkit-scrollbar-corner { background:transparent; }
+        /* ── Scrollbars — let browser handle show/hide natively ── */
+        .pivot-scroll, .table-scroll { scrollbar-width:thin; scrollbar-color:rgba(106,163,255,0.25) transparent; }
 
         /* ── App shell with sidebar ── */
         .app-shell {
@@ -598,6 +729,8 @@ export default function Home() {
         }
       `}</style>
 
+      <input ref={fileInputRef} type="file" accept=".xlsx" onChange={handleFileUpload} hidden />
+
       {/* ── Navbar ── */}
       <nav className="navbar">
         <div className="nav-brand">
@@ -605,15 +738,7 @@ export default function Home() {
           XTB Tax
         </div>
         <div className="nav-right">
-          {/* Point 1: Year filter buttons */}
-          {availableYears.length > 0 && (
-            <div className="year-filter">
-              <span className="year-label">Year</span>
-              {availableYears.map(y => (
-                <button key={y} className={`year-btn ${selectedYear === y ? 'active' : ''}`} onClick={() => setSelectedYear(y)}>{y}</button>
-              ))}
-            </div>
-          )}
+
           {fileName && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <div className="nav-file">
@@ -624,36 +749,66 @@ export default function Home() {
               </div>
               {lastImported && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  {restored && (
-                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--accent)', background: 'rgba(106,163,255,0.1)', border: '1px solid rgba(106,163,255,0.25)', borderRadius: 4, padding: '2px 7px' }}>
-                      Cached
-                    </span>
-                  )}
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)' }}>
                     {lastImported}
                   </span>
-                  <button
-                    title="Clear cached data"
-                    onClick={() => { localStorage.removeItem('xtb_cache'); setFileName(''); setRows([]); setLastImported(''); setRestored(false); setFxWarnings([]); setSelectedYear(0) }}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 14, lineHeight: 1, padding: '0 2px', transition: 'color 0.15s' }}
-                    onMouseEnter={e => (e.currentTarget.style.color = 'var(--red)')}
-                    onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-3)')}
-                  >
-                    ×
-                  </button>
+
                 </div>
               )}
             </div>
           )}
-          {/* Point 3: progress message inside the button area */}
-          {loading && loadingMsg
-            ? <div className="loading-msg"><div className="spinner" />{loadingMsg}</div>
-            : <button className="upload-btn" onClick={triggerFileUpload} disabled={loading}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                Import
-              </button>
-          }
-          <input ref={fileInputRef} type="file" accept=".xlsx" onChange={handleFileUpload} hidden />
+          {/* Import button — only shown after a file is loaded */}
+          {fileName && (
+            loading && loadingMsg
+              ? <div className="loading-msg"><div className="spinner" />{loadingMsg}</div>
+              : <button
+                  onClick={triggerFileUpload}
+                  disabled={loading}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '7px 12px',
+                    fontFamily: 'Syne, sans-serif', fontSize: 11, fontWeight: 600,
+                    letterSpacing: '0.06em', textTransform: 'uppercase',
+                    color: 'var(--text-2)',
+                    background: 'transparent',
+                    border: '1px solid var(--border)',
+                    borderRadius: 6,
+                    cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.color = 'var(--text-1)'; e.currentTarget.style.borderColor = 'var(--border-hi)' }}
+                  onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-2)'; e.currentTarget.style.borderColor = 'var(--border)' }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  Import New
+                </button>
+          )}
+          {/* Close button — rightmost, only shown when file is loaded */}
+          {fileName && !loading && (
+            <button
+              title="Close file and return to start"
+              onClick={() => { localStorage.removeItem('xtb_cache'); localStorage.removeItem('xtb_selected_year'); setFileName(''); setRows([]); setOpenRows([]); setLastImported(''); setRestored(false); setFxWarnings([]); setSelectedYear(0); setActiveView('overview') }}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                padding: '7px 12px',
+                fontFamily: 'Syne, sans-serif', fontSize: 11, fontWeight: 600,
+                letterSpacing: '0.06em', textTransform: 'uppercase',
+                color: 'var(--text-3)',
+                background: 'transparent',
+                border: '1px solid var(--border)',
+                borderRadius: 6,
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.borderColor = 'rgba(255,128,144,0.3)' }}
+              onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-3)'; e.currentTarget.style.borderColor = 'var(--border)' }}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+              Close
+            </button>
+          )}
         </div>
       </nav>
 
@@ -663,65 +818,36 @@ export default function Home() {
         {rows.length > 0 && (
           <aside className="sidebar">
             <div className="sidebar-section">
-              <div className="sidebar-section-label">Overview</div>
-
-              <button className={`sidebar-item ${activeView === 'overview' ? 'active' : ''}`} onClick={() => setActiveView('overview')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
-                </svg>
-                Dashboard
-              </button>
-
-              <button className={`sidebar-item ${activeView === 'tax' ? 'active' : ''}`} onClick={() => setActiveView('tax')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
-                </svg>
-                Tax Summary
-              </button>
-            </div>
-
-            <div className="sidebar-divider" />
-
-            <div className="sidebar-section">
               <div className="sidebar-section-label">Trades</div>
 
-              <button className={`sidebar-item ${activeView === 'closed' ? 'active' : ''}`} onClick={() => setActiveView('closed')}>
+              <button className={`sidebar-item ${activeView === 'overview' ? 'active' : ''}`} onClick={() => setActiveView('overview')}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
                 </svg>
                 Closed Trades
               </button>
 
-              <button className="sidebar-item sidebar-item-disabled">
+              <button className={`sidebar-item ${activeView === 'open' ? 'active' : ''}`} onClick={() => setActiveView('open')}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
                 </svg>
                 Open Positions
-                <span className="sidebar-soon">Soon</span>
               </button>
             </div>
-
-
           </aside>
         )}
 
         {/* ── Empty state (no sidebar) ── */}
         {!fileName && !loading && (
           <div className="empty-wrap" style={{ flex: 1 }}>
-            <div className="empty-icon-ring">
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="rgba(78,143,255,0.6)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <div className="empty-icon-ring" onClick={triggerFileUpload} title="Click to import file">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="rgba(78,143,255,0.7)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
                 <line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>
               </svg>
             </div>
             <div className="empty-title">Import your XTB statement</div>
             <div className="empty-sub">Upload a .xlsx export file to calculate your tax obligations</div>
-            <button className="upload-btn" onClick={triggerFileUpload}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-              </svg>
-              Choose File
-            </button>
             {error && <p style={{ color: 'var(--red)', fontSize: 12, marginTop: 4 }}>{error}</p>}
           </div>
         )}
@@ -749,6 +875,15 @@ export default function Home() {
 
           {/* ── Overview: cards + pivot ── */}
           {activeView === 'overview' && (
+          <>
+          {availableYears.length > 0 && (
+            <div className="year-filter" style={{ marginBottom: 20 }}>
+              <span className="year-label">Year</span>
+              {availableYears.map(y => (
+                <button key={y} className={`year-btn ${selectedYear === y ? 'active' : ''}`} onClick={() => setSelectedYear(y)}>{y}</button>
+              ))}
+            </div>
+          )}
           <div className="dashboard-split">
             <div className="cards-col">
               <div className="card appear-1">
@@ -773,6 +908,38 @@ export default function Home() {
                   <span className="card-row-label">Declare income?</span>
                   <span className={`declare-pill ${mustDeclare ? 'pill-yes' : 'pill-no'}`}>{mustDeclare ? 'Yes' : 'No'}</span>
                 </div>
+                <div className="card-row">
+                  <span className="card-row-label">Tax owed?</span>
+                  <span className={`declare-pill ${taxOwed ? 'pill-yes' : 'pill-no'}`}>{taxOwed ? 'Yes' : 'No'}</span>
+                </div>
+              </div>
+              <div className="card appear-3">
+                {(() => {
+                  const remaining = Math.max(0, taxablePurchaseCZK - taxableSaleCZK)
+                  const pct = taxablePurchaseCZK > 0 ? Math.min(100, (taxableSaleCZK / taxablePurchaseCZK) * 100) : 0
+                  const barColor = remaining <= 0 ? 'var(--red)' : pct >= 80 ? 'var(--amber)' : 'var(--green)'
+                  return (
+                    <>
+                      <div className="card-eyebrow">Sellable Budget</div>
+                      <div className="card-value" style={{ color: remaining <= 0 ? 'var(--red)' : 'var(--text-1)' }}>{formatCZK(remaining)}</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: -12, marginBottom: 14 }}>
+                        before tax becomes due
+                      </div>
+                      <div style={{ height: 4, borderRadius: 99, background: 'rgba(255,255,255,0.06)', marginBottom: 14, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${pct}%`, borderRadius: 99, background: barColor, transition: 'width 0.4s ease' }} />
+                      </div>
+                      <div className="card-sep" />
+                      <div className="card-row">
+                        <span className="card-row-label">Taxable sales</span>
+                        <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: barColor }}>{formatCZK(taxableSaleCZK)}</span>
+                      </div>
+                      <div className="card-row">
+                        <span className="card-row-label">Taxable purchases</span>
+                        <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-2)' }}>{formatCZK(taxablePurchaseCZK)}</span>
+                      </div>
+                    </>
+                  )
+                })()}
               </div>
             </div>
 
@@ -815,6 +982,7 @@ export default function Home() {
               </div>
             </div>
           </div>
+          </>
           )}
 
           {/* ── Tax Summary view: cards only ── */}
@@ -888,8 +1056,210 @@ export default function Home() {
             </div>
           )}
 
+          {/* ── Open Positions view ── */}
+          {activeView === 'open' && (
+            <div>
+              {openRows.length === 0 ? (
+                <div style={{ color: 'var(--text-3)', fontSize: 13, padding: '40px 0', textAlign: 'center' }}>
+                  No open positions found in this file.
+                </div>
+              ) : (
+                <>
+                  {/* Card + symbol table side by side */}
+                  <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', marginBottom: 24 }}>
+                    <div className="card appear-1" style={{ minWidth: 220, flexShrink: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.04em', color: 'var(--text-1)', marginBottom: 14, paddingBottom: 10, borderBottom: '1px solid var(--border)' }}>Summary</div>
+                      <div className="card-sep" style={{ marginTop: 10 }} />
+                      <div style={{ marginBottom: 6 }}>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Total purchase value</div>
+                        <div className="card-value" style={{ fontSize: 18, marginBottom: 0, textAlign: 'right' }}>{openRows.reduce((s, r) => s + Number(r['Purchase value'] ?? 0), 0).toFixed(2)} EUR</div>
+                      </div>
+                      <div className="card-sep" style={{ marginTop: 14 }} />
+                      <div style={{ marginBottom: 14 }}>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Unrealised P/L</div>
+                        <div style={{ fontFamily: 'var(--mono)', fontSize: 15, fontWeight: 400, textAlign: 'right' }} className={openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0) >= 0 ? 'num-green' : 'num-red'}>
+                          {openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0) >= 0 ? '+' : ''}
+                          {openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0).toFixed(2)} EUR
+                        </div>
+                      </div>
+                      <div className="card-sep" />
+                      <div style={{ marginTop: 14 }}>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Current value</div>
+                        <div className="card-value" style={{ fontSize: 18, marginBottom: 0, textAlign: 'right' }}>{openRows.reduce((s, r) => s + Number(r['Volume'] ?? 0) * Number(r['Market price'] ?? 0), 0).toFixed(2)} EUR</div>
+                      </div>
+                    </div>
+
+                  {/* Symbol summary — tax exempt volume */}
+                  {(() => {
+                    const symbolMap = new Map<string, { total: number; exempt: number }>()
+                    for (const r of openRows) {
+                      const sym = String(r['Symbol'] ?? '—')
+                      const vol = Number(r['Volume'] ?? 0)
+                      const exempt = r['Tax exempt'] === 'Yes'
+                      if (!symbolMap.has(sym)) symbolMap.set(sym, { total: 0, exempt: 0 })
+                      const e = symbolMap.get(sym)!
+                      e.total += vol
+                      if (exempt) e.exempt += vol
+                    }
+                    const symbols = [...symbolMap.entries()].sort((a, b) => b[1].total - a[1].total)
+                    return (
+                      <div className="table-shell appear-1" style={{ marginBottom: 24 }}>
+                        <div className="table-topbar">
+                          <div className="table-topbar-left">
+                            <span className="table-label">By Symbol</span>
+                            <span className="table-count">{symbols.length}</span>
+                          </div>
+                        </div>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th style={{ textAlign: 'left' }}>Symbol</th>
+                              <th>Total Volume</th>
+                              <th>Not Exempt Volume</th>
+                              <th>Exempt Volume</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {symbols.map(([sym, { total, exempt }]) => {
+                              const notExempt = total - exempt
+                              const allExempt = notExempt < 0.0001
+                              return (
+                                <tr key={sym}>
+                                  <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{sym}</td>
+                                  <td>{total.toFixed(4)}</td>
+                                  <td className={notExempt > 0.0001 ? 'num-red' : 'pnl-zero'}>{notExempt > 0.0001 ? notExempt.toFixed(4) : '—'}</td>
+                                  <td className="num-green">{exempt > 0 ? exempt.toFixed(4) : '—'}</td>
+
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )
+                  })()}
+
+                  {/* ── What can I sell? dashboard ── */}
+                  {todayFx > 0 && (() => {
+                    const remaining = Math.max(0, taxablePurchaseCZK - taxableSaleCZK)
+                    // Build per-symbol summary from openRows
+                    const symMap = new Map<string, { volume: number; marketPrice: number }>()
+                    for (const r of openRows) {
+                      const sym = String(r['Symbol'] ?? '—')
+                      const vol = Number(r['Volume'] ?? 0)
+                      const mp  = Number(r['Market price'] ?? 0)
+                      if (!symMap.has(sym)) symMap.set(sym, { volume: 0, marketPrice: mp })
+                      symMap.get(sym)!.volume += vol
+                    }
+                    const symbols = [...symMap.entries()].map(([sym, { volume, marketPrice }]) => {
+                      const estFullCZK = volume * marketPrice * todayFx
+                      const maxSellCZK  = Math.min(Math.max(remaining, 0), estFullCZK)
+                      const maxSellVol  = todayFx && marketPrice ? maxSellCZK / (marketPrice * todayFx) : 0
+                      const canSellAll  = estFullCZK <= remaining
+                      return { sym, volume, marketPrice, maxSellCZK, maxSellVol, canSellAll }
+                    }).sort((a, b) => b.maxSellVol - a.maxSellVol)
+
+                    return (
+                      <div className="table-shell appear-2" style={{ marginBottom: 24 }}>
+                        <div className="table-topbar">
+                          <div className="table-topbar-left">
+                            <span className="table-label">What can I sell?</span>
+                            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: remaining > 0 ? 'var(--green)' : 'var(--red)', background: remaining > 0 ? 'rgba(61,224,176,0.08)' : 'rgba(255,128,144,0.08)', border: `1px solid ${remaining > 0 ? 'rgba(61,224,176,0.2)' : 'rgba(255,128,144,0.2)'}`, borderRadius: 4, padding: '2px 8px' }}>
+                              {remaining > 0 ? `${Math.round(remaining).toLocaleString('cs-CZ')} Kč available` : `No budget remaining`}
+                            </span>
+                          </div>
+                          {todayFx > 0 && (
+                            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
+                              EUR/CZK {todayFx.toFixed(3)} <span style={{ fontSize: 10 }}>ČNB today</span>
+                            </span>
+                          )}
+                        </div>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th style={{ textAlign: 'left' }}>Symbol</th>
+                              <th>Total Volume</th>
+                              <th>Market Price</th>
+                              <th>Max Sellable Volume</th>
+                              <th>Max Sellable CZK</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {symbols.map(({ sym, volume, marketPrice, maxSellCZK, maxSellVol, canSellAll }) => (
+                              <tr key={sym}>
+                                <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{sym}</td>
+                                <td>{volume.toFixed(4)}</td>
+                                <td>{marketPrice.toFixed(4)}</td>
+                                <td className={canSellAll ? 'num-green' : 'num-red'}>{maxSellVol.toFixed(4)}</td>
+                                <td className={canSellAll ? 'num-green' : 'num-red'}>{Math.round(maxSellCZK).toLocaleString('cs-CZ')} Kč</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )
+                  })()}
+                  </div>
+
+                  {/* Open positions table */}
+                  <div className="table-shell appear-3">
+                    <div className="table-topbar">
+                      <div className="table-topbar-left">
+                        <span className="table-label">Open Positions</span>
+                        <span className="table-count">{openRows.length}</span>
+                      </div>
+                    </div>
+                    <div className="table-scroll" style={{ overflowX: 'auto' }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            {[['Symbol','left'],['Type','right'],['Volume','right'],['Open Date','right'],['Days Held','right'],['Open Price','right'],['Market Price','right'],['Purchase EUR','right'],['Gross P/L','right'],['Tax Exempt','center'],['Days to Exempt','center']].map(([col, align]) => (
+                              <th
+                                key={col}
+                                style={{ textAlign: align as any }}
+                                className={openSortKey === col ? 'th-active' : ''}
+                                onClick={() => {
+                                  if (openSortKey === col) setOpenSortDir(p => p === 'asc' ? 'desc' : 'asc')
+                                  else { setOpenSortKey(col); setOpenSortDir('asc') }
+                                }}
+                              >
+                                {col}{openSortKey && openSortKey === col ? (openSortDir === 'asc' ? ' ▲' : ' ▼') : ''}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sortedOpenRows.map((r, i) => {
+                            const pnl = Number(r['Gross P/L'] ?? 0)
+                            const exempt = r['Tax exempt'] === 'Yes'
+                            const daysToExempt = Number(r['Days to exempt'] ?? 0)
+                            return (
+                              <tr key={i}>
+                                <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{String(r['Symbol'] ?? '')}</td>
+                                <td>{String(r['Type'] ?? '')}</td>
+                                <td>{String(r['Volume'] ?? '')}</td>
+                                <td>{String(r['_openDisplay'] ?? '').split(' ')[0]}</td>
+                                <td>{String(r['Days held'] ?? '')}</td>
+                                <td>{String(r['Open price'] ?? '')}</td>
+                                <td>{String(r['Market price'] ?? '')}</td>
+                                <td>{String(r['Purchase value'] ?? '')}</td>
+                                <td style={{ color: pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</td>
+                                <td style={{ color: exempt ? 'var(--green)' : 'var(--red)', textAlign: 'center' }}>{r['Tax exempt'] ?? ''}</td>
+                                <td style={{ color: daysToExempt <= 180 && !exempt ? 'var(--amber)' : 'var(--text-3)', textAlign: 'center' }}>{exempt ? '—' : daysToExempt}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           {/* ── Trades table — shown in overview and closed views ── */}
-          {(activeView === 'overview' || activeView === 'closed') && (
+          {activeView === 'overview' && (
             <div className="table-shell appear-4">
               <div className="table-topbar">
                 <div className="table-topbar-left">
