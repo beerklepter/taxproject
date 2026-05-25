@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useMemo, useEffect } from 'react'
+import { useState, useRef, useMemo, useEffect, useCallback } from 'react'
 import * as XLSX from 'xlsx'
 
 const HIDDEN_COLUMNS = new Set(['Open origin', 'Close origin', 'SL', 'TP', 'Margin', 'Comment', '_openDisplay', '_closeDisplay', 'Position', 'Open price', 'Close price', 'Commission', 'Swap', 'Rollover'])
@@ -11,14 +11,13 @@ function formatCZK(value: number) {
   return new Intl.NumberFormat('cs-CZ', { style: 'currency', currency: 'CZK', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(value)
 }
 
-const CACHE_VERSION = 3
+const CACHE_VERSION = 4
 
 export default function Home() {
   const [fileName, setFileName]         = useState('')
   const [rows, setRows]                 = useState<TradeRow[]>([])
   const [openRows, setOpenRows]           = useState<TradeRow[]>([])
   const [error, setError]               = useState('')
-  const [page, setPage]                 = useState(0)
   const [loading, setLoading]           = useState(false)
   const [loadingMsg, setLoadingMsg]     = useState('')
   const [fxWarnings, setFxWarnings]     = useState<string[]>([])
@@ -29,9 +28,26 @@ export default function Home() {
   const [openSortDir, setOpenSortDir]   = useState<'asc' | 'desc'>('asc')
   const [lastImported, setLastImported] = useState<string>('')
   const [todayFx, setTodayFx]             = useState<number>(0)
-  const [restored, setRestored]         = useState(false)
   const [activeView, setActiveView]     = useState<string>('overview')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const fxCache = useRef(new Map<string, Promise<number | ''>>())
+
+  const fetchFx = useCallback(async (date: string): Promise<number | ''> => {
+    if (!date) return ''
+    const cached = fxCache.current.get(date)
+    if (cached) return cached
+    const promise = (async () => {
+      try {
+        const res = await fetch(`/api/fx?date=${encodeURIComponent(date)}`)
+        const text = await res.text()
+        let rate: number | '' = ''
+        try { rate = JSON.parse(text).rate ?? '' } catch { rate = '' }
+        return rate !== '' ? Number(rate) : ''
+      } catch { return '' }
+    })()
+    fxCache.current.set(date, promise)
+    return promise
+  }, [])
 
   // Fetch today's EUR/CZK rate when open positions are loaded
   useEffect(() => {
@@ -39,7 +55,7 @@ export default function Home() {
     const today = new Date()
     const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`
     fetchFx(todayStr).then(rate => { if (rate) setTodayFx(rate as number) })
-  }, [openRows])
+  }, [openRows, fetchFx])
 
   // Persist selectedYear whenever it changes
   useEffect(() => {
@@ -61,7 +77,6 @@ export default function Home() {
           setOpenRows(or ?? [])
           setFxWarnings(w ?? [])
           setLastImported(li ?? '')
-          setRestored(true)
           // Restore selected year from its own key
           const savedYear = localStorage.getItem('xtb_selected_year')
           if (savedYear && Number(savedYear) > 0) {
@@ -112,24 +127,6 @@ export default function Home() {
     return closeDate > anniversary ? 'Yes' : 'No'
   }
 
-  const fxCache = useRef(new Map<string, Promise<number | ''>>())
-  async function fetchFx(date: string): Promise<number | ''> {
-    if (!date) return ''
-    const cached = fxCache.current.get(date)
-    if (cached) return cached
-    const promise = (async () => {
-      try {
-        const res = await fetch(`/api/fx?date=${date}`)
-        const text = await res.text()
-        let rate: number | '' = ''
-        try { rate = JSON.parse(text).rate ?? '' } catch { rate = '' }
-        return rate !== '' ? Number(rate) : ''
-      } catch { return '' }
-    })()
-    fxCache.current.set(date, promise)
-    return promise
-  }
-
   function handleFileUpload(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     if (!file) return
@@ -143,9 +140,6 @@ export default function Home() {
     setFxWarnings([])
     setSelectedYear(0)
     setLastImported('')
-    setRestored(false)
-    setPage(0)
-
     const reader = new FileReader()
     reader.onload = async (e) => {
       try {
@@ -266,10 +260,10 @@ export default function Home() {
                 const threeYearsLater = new Date(openDateObj.getFullYear() + 3, openDateObj.getMonth(), openDateObj.getDate() + 1)
                 if (today >= threeYearsLater) {
                   obj['Tax exempt'] = 'Yes'
-                  obj['Days to exempt'] = 0
+                  obj['Days to Exempt'] = 0
                 } else {
                   obj['Tax exempt'] = 'No'
-                  obj['Days to exempt'] = Math.round((threeYearsLater.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
+                  obj['Days to Exempt'] = Math.round((threeYearsLater.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
                 }
               }
 
@@ -278,11 +272,15 @@ export default function Home() {
 
             // Clean up internal date key
             for (const obj of openJson) {
+              const pv = Number(obj['Purchase value'] ?? 0)
+              const gpl = Number(obj['Gross P/L'] ?? 0)
+              obj['_pctPL'] = pv > 0 ? (gpl / pv) * 100 : 0
               delete obj['_openApiDate']
             }
 
-            setOpenRows(openJson)
-            outerOpenJson = openJson
+            const sortedOpen = [...openJson].sort((a, b) => Number(a['Days to Exempt'] ?? 0) - Number(b['Days to Exempt'] ?? 0))
+            setOpenRows(sortedOpen)
+            outerOpenJson = sortedOpen
           }
         }
 
@@ -311,20 +309,11 @@ export default function Home() {
           console.warn('localStorage quota exceeded — data not cached', e)
         }
         setLastImported(importedAt)
-        setRestored(false)
         setRows(json)
       } catch (err) { console.error(err); setError('Failed to process file') }
       finally { setLoading(false); setLoadingMsg('') }
     }
     reader.readAsArrayBuffer(file)
-  }
-
-  function exportToExcel() {
-    if (!rows.length) return
-    const ws = XLSX.utils.json_to_sheet(rows)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, 'Trades')
-    XLSX.writeFile(wb, 'xtb_trades_export.xlsx')
   }
 
   // Point 1: available years derived from close dates
@@ -353,10 +342,27 @@ export default function Home() {
     })
   }, [filteredRows, sortKey, sortDir])
 
+  // Map display column headers → actual data field names
+  const OPEN_COL_MAP: Record<string, string> = {
+    'Symbol':        'Symbol',
+    'Type':          'Type',
+    'Volume':        'Volume',
+    'Open Date':     '_openDisplay',
+    'Days Held':     'Days held',
+    'Open Price':    'Open price',
+    'Market Price':  'Market price',
+    'Purchase EUR':  'Purchase value',
+    'Gross P/L':     'Gross P/L',
+    '% P/L':         '_pctPL',
+    'Tax Exempt':    'Tax exempt',
+    'Days to Exempt':'Days to Exempt',
+  }
+
   const sortedOpenRows = useMemo(() => {
     if (!openSortKey) return openRows
+    const dataKey = OPEN_COL_MAP[openSortKey] ?? openSortKey
     return [...openRows].sort((a, b) => {
-      const av = a[openSortKey], bv = b[openSortKey]
+      const av = a[dataKey], bv = b[dataKey]
       const aNum = Number(av), bNum = Number(bv)
       const bothNumbers = !isNaN(aNum) && !isNaN(bNum)
       const result = bothNumbers ? aNum - bNum : String(av ?? '').localeCompare(String(bv ?? ''))
@@ -399,6 +405,15 @@ export default function Home() {
     }
     return Array.from(map.values()).sort((a, b) => b.taxableSaleCZK - a.taxableSaleCZK)
   }, [filteredRows])
+
+  function exportToExcel() {
+    if (!filteredRows.length) return
+    const ws = XLSX.utils.json_to_sheet(filteredRows)
+    const wb = XLSX.utils.book_new()
+    const suffix = selectedYear ? `_${selectedYear}` : '_all'
+    XLSX.utils.book_append_sheet(wb, ws, 'Trades')
+    XLSX.writeFile(wb, `xtb_trades_export${suffix}.xlsx`)
+  }
 
   return (
     <div style={{ background: '#10151f', minHeight: '100vh', color: '#c9d1e0', fontFamily: "'Syne', sans-serif" }}>
@@ -573,9 +588,314 @@ export default function Home() {
         .pill-yes { background:rgba(255,128,144,0.1); color:var(--red);   border:1px solid rgba(255,128,144,0.25); }
         .pill-no  { background:rgba(61,224,176,0.1);  color:var(--green); border:1px solid rgba(61,224,176,0.25); }
 
-        /* ── Dashboard split ── */
+        /* ── Dashboard split (legacy / other uses) ── */
         .dashboard-split { display:grid; grid-template-columns:auto 1fr; gap:14px; margin-bottom:28px; align-items:start; }
-        .cards-col { display:flex; flex-direction:column; gap:14px; }
+
+        /* ── Closed trades workspace ── */
+        .closed-workspace { display: flex; flex-direction: column; gap: 24px; margin-bottom: 8px; }
+        .closed-workspace-header {
+          display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px 24px;
+          padding-bottom: 20px; border-bottom: 1px solid var(--border);
+        }
+        .closed-workspace-titles { min-width: 0; }
+        .closed-workspace-title {
+          font-size: 22px; font-weight: 700; letter-spacing: -0.02em; color: var(--text-1); line-height: 1.2; margin-bottom: 6px;
+        }
+        .closed-workspace-meta {
+          font-size: 12px; color: var(--text-3); letter-spacing: 0.02em; max-width: 520px; line-height: 1.5;
+        }
+        .closed-workspace-meta strong { color: var(--text-2); font-weight: 600; }
+        .year-filter-inline {
+          display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+          padding: 8px 12px; background: rgba(0,0,0,0.22); border: 1px solid var(--border); border-radius: 10px;
+        }
+        .closed-dashboard-body {
+          display: grid;
+          grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+          gap: 20px;
+          align-items: stretch;
+        }
+        @media (max-width: 1100px) {
+          .closed-dashboard-body { grid-template-columns: 1fr; }
+        }
+        .closed-left-stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+        .closed-left-stack .card { max-width: none; width: 100%; min-width: 0; }
+        .panel-header {
+          display: flex; align-items: center; justify-content: space-between; gap: 12px;
+          margin: -6px 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+        }
+        .panel-header-title { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-2); }
+        .panel-header-badge {
+          font-family: var(--mono); font-size: 10px; font-weight: 500; color: var(--accent);
+          background: rgba(106,163,255,0.1); border: 1px solid rgba(106,163,255,0.2); border-radius: 6px; padding: 4px 10px;
+        }
+        .summary-dual {
+          display: grid;
+          grid-template-columns: 1fr auto 1fr;
+          gap: 0 18px;
+          align-items: start;
+          margin-bottom: 20px;
+        }
+        .summary-dual-col { min-width: 0; }
+        .summary-dual-rule { width: 1px; background: linear-gradient(180deg, transparent, var(--border) 8%, var(--border) 92%, transparent); align-self: stretch; min-height: 120px; }
+        .summary-outcome {
+          padding-top: 18px; border-top: 1px solid var(--border);
+        }
+        .summary-outcome .card-value { margin-bottom: 14px; }
+        .pivot-shell.closed-pivot { display: flex; flex-direction: column; min-height: 0; max-height: min(560px, calc(100vh - 320px)); }
+        .pivot-shell.closed-pivot .pivot-scroll {
+          flex: 1;
+          min-height: 200px;
+          overflow: auto;
+          position: relative;
+        }
+        .pivot-shell.closed-pivot .pivot-table thead th {
+          position: sticky;
+          top: 0;
+          z-index: 4;
+          background-color: var(--bg-card);
+          background-image: linear-gradient(rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.35));
+          background-clip: padding-box;
+          box-shadow: 0 1px 0 var(--border);
+        }
+        .pivot-sub { font-size: 11px; color: var(--text-3); font-weight: 500; letter-spacing: 0.02em; margin-top: 4px; }
+        .table-shell.closed-positions-shell { margin-top: 0; }
+        .table-shell.closed-positions-shell .table-topbar { padding: 16px 22px; }
+        .table-meta { font-size: 11px; color: var(--text-3); font-weight: 500; margin-top: 4px; letter-spacing: 0.02em; }
+
+        /* ── Open Positions dashboard ── */
+        .open-workspace { display: flex; flex-direction: column; gap: 22px; margin-bottom: 24px; }
+        .open-workspace-header {
+          padding-bottom: 18px;
+          border-bottom: 1px solid var(--border);
+        }
+        .open-workspace-title {
+          font-size: 20px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          color: var(--text-1);
+          margin-bottom: 6px;
+        }
+        .open-workspace-meta {
+          font-size: 12px;
+          color: var(--text-3);
+          line-height: 1.55;
+          max-width: 640px;
+        }
+        .open-workspace-meta strong { color: var(--text-2); font-weight: 600; }
+        .open-dash-grid {
+          display: grid;
+          grid-template-columns: minmax(260px, 300px) minmax(0, 1fr);
+          grid-template-rows: auto auto;
+          gap: 16px;
+          align-items: start;
+          min-height: 0;
+        }
+        @media (max-width: 960px) {
+          .open-dash-grid {
+            grid-template-columns: 1fr;
+            grid-template-rows: none;
+          }
+        }
+        .open-dash-card {
+          background: var(--bg-card);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          overflow: hidden;
+          display: flex;
+          flex-direction: column;
+          min-height: 0;
+          box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset;
+        }
+        .open-dash-card--summary  { grid-column: 1; grid-row: 1; }
+        .open-dash-card--headroom { grid-column: 1; grid-row: 2; }
+        .open-dash-card--symbols  { grid-column: 2; grid-row: 1 / -1; align-self: start; width: fit-content; }
+        @media (max-width: 960px) {
+          .open-dash-card--summary,
+          .open-dash-card--headroom,
+          .open-dash-card--symbols { grid-column: 1; grid-row: auto; }
+        }
+        .open-dash-card-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 14px 18px;
+          border-bottom: 1px solid var(--border);
+          background: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%);
+        }
+        .open-dash-card-head-tight { flex-wrap: wrap; align-items: flex-start; }
+        .open-dash-head-left { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+        .open-dash-kicker {
+          font-size: 10px;
+          font-weight: 700;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+          color: var(--text-3);
+        }
+        .open-dash-head-title {
+          font-size: 14px;
+          font-weight: 600;
+          color: var(--text-1);
+          letter-spacing: -0.01em;
+        }
+        .open-dash-badge {
+          font-family: var(--mono);
+          font-size: 10px;
+          font-weight: 600;
+          letter-spacing: 0.04em;
+          padding: 5px 10px;
+          border-radius: 6px;
+          flex-shrink: 0;
+        }
+        .open-dash-badge--ok { color: var(--green); background: rgba(61,224,176,0.1); border: 1px solid rgba(61,224,176,0.22); }
+        .open-dash-badge--warn { color: var(--amber); background: rgba(245,166,35,0.08); border: 1px solid rgba(245,166,35,0.2); }
+        .open-dash-badge--bad { color: var(--red); background: rgba(255,128,144,0.1); border: 1px solid rgba(255,128,144,0.22); }
+        .open-dash-fx {
+          font-family: var(--mono);
+          font-size: 11px;
+          color: var(--text-2);
+          padding: 6px 11px;
+          border-radius: 8px;
+          border: 1px solid var(--border);
+          background: rgba(0,0,0,0.22);
+        }
+        .open-dash-stat-stack { display: flex; flex-direction: column; }
+        .open-dash-stat {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 4px;
+          padding: 10px 18px;
+          border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+        .open-dash-stat:last-child { border-bottom: none; }
+        .open-dash-stat-label {
+          font-size: 10px;
+          font-weight: 600;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: var(--text-3);
+          align-self: stretch;
+          text-align: left;
+        }
+        .open-dash-stat-value {
+          font-family: var(--mono);
+          font-size: 18px;
+          font-weight: 400;
+          color: var(--text-1);
+          letter-spacing: -0.02em;
+        }
+        .open-dash-scroll {
+          overflow: auto;
+        }
+        .open-dash-table { width: 100%; border-collapse: collapse; }
+        .open-dash-card--symbols .open-dash-table { width: auto; }
+        .open-dash-table thead th {
+          position: sticky;
+          top: 0;
+          z-index: 1;
+          font-family: 'Syne', sans-serif;
+          font-size: 9px;
+          font-weight: 600;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: var(--text-3);
+          padding: 10px 14px;
+          text-align: right;
+          white-space: nowrap;
+          border-bottom: 1px solid var(--border);
+          background: rgba(10,14,22,0.96);
+          background-color: var(--bg-card);
+          background-image: linear-gradient(rgba(0,0,0,0.35), rgba(0,0,0,0.35));
+          box-shadow: 0 1px 0 var(--border);
+        }
+        .open-dash-table thead th:first-child { text-align: left; }
+        .open-dash-table tbody td {
+          padding: 9px 14px;
+          font-family: var(--mono);
+          font-size: 11px;
+          color: var(--text-2);
+          text-align: right;
+          border-bottom: 1px solid rgba(255,255,255,0.04);
+        }
+        .open-dash-table tbody td:first-child {
+          text-align: left;
+          font-family: 'Syne', sans-serif;
+          font-size: 12px;
+          font-weight: 600;
+          color: var(--text-1);
+        }
+        .open-dash-table tbody tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
+        .open-dash-table tbody tr:hover { background: rgba(106,163,255,0.06) !important; }
+        .open-dash-hr-body { padding: 18px; display: flex; flex-direction: column; gap: 18px; flex: 1; min-height: 0; }
+        .open-dash-hr-kpis {
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+        }
+        .open-dash-hr-hero-num {
+          font-family: var(--mono);
+          font-size: 28px;
+          font-weight: 400;
+          letter-spacing: -0.03em;
+          line-height: 1.1;
+          margin: 6px 0 4px;
+        }
+        .open-dash-hr-hero-sub { font-family: var(--mono); font-size: 13px; color: var(--text-2); }
+        .open-dash-hr-bar {
+          height: 6px;
+          border-radius: 99px;
+          background: rgba(255,255,255,0.07);
+          overflow: hidden;
+          margin-top: 14px;
+        }
+        .open-dash-hr-bar-fill { height: 100%; border-radius: 99px; transition: width 0.35s ease; }
+        .open-dash-hr-side {
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          padding: 14px 16px;
+          border-radius: 10px;
+          border: 1px solid rgba(255,255,255,0.08);
+          background: rgba(0,0,0,0.18);
+        }
+        .open-dash-hr-side-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          gap: 12px;
+          font-size: 12px;
+        }
+        .open-dash-hr-side-label { color: var(--text-2); }
+        .open-dash-hr-side-val { font-family: var(--mono); font-size: 12px; }
+        .open-dash-hr-note {
+          font-size: 11px;
+          color: var(--text-3);
+          line-height: 1.5;
+          max-width: 52rem;
+        }
+        .open-dash-hr-table-head {
+          padding: 10px 18px;
+          border-top: 1px solid var(--border);
+          border-bottom: 1px solid var(--border);
+          background: rgba(0,0,0,0.12);
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .open-dash-hint {
+          font-size: 12px;
+          color: var(--text-3);
+          line-height: 1.55;
+          padding: 14px 18px;
+          border-radius: 10px;
+          margin: 0 18px 18px;
+          border: 1px dashed rgba(255,255,255,0.12);
+          background: rgba(0,0,0,0.12);
+        }
+        .open-register-shell { border-radius: 12px; }
 
         /* ── Table shell ── */
         .table-shell { background:var(--bg-card); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
@@ -624,7 +944,7 @@ export default function Home() {
         .pnl-zero { color:var(--text-3); }
 
         /* ── Scrollbars — let browser handle show/hide natively ── */
-        .pivot-scroll, .table-scroll { scrollbar-width:thin; scrollbar-color:rgba(106,163,255,0.25) transparent; }
+        .pivot-scroll, .table-scroll, .open-dash-scroll { scrollbar-width:thin; scrollbar-color:rgba(106,163,255,0.25) transparent; }
 
         /* ── App shell with sidebar ── */
         .app-shell {
@@ -787,7 +1107,7 @@ export default function Home() {
           {fileName && !loading && (
             <button
               title="Close file and return to start"
-              onClick={() => { localStorage.removeItem('xtb_cache'); localStorage.removeItem('xtb_selected_year'); setFileName(''); setRows([]); setOpenRows([]); setLastImported(''); setRestored(false); setFxWarnings([]); setSelectedYear(0); setActiveView('overview') }}
+              onClick={() => { localStorage.removeItem('xtb_cache'); localStorage.removeItem('xtb_selected_year'); setFileName(''); setRows([]); setOpenRows([]); setLastImported(''); setFxWarnings([]); setSelectedYear(0); setActiveView('overview'); if (fileInputRef.current) fileInputRef.current.value = '' }}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 6,
                 padding: '7px 12px',
@@ -876,109 +1196,109 @@ export default function Home() {
           {/* ── Overview: cards + pivot ── */}
           {activeView === 'overview' && (
           <>
-          {availableYears.length > 0 && (
-            <div className="year-filter" style={{ marginBottom: 20 }}>
-              <span className="year-label">Year</span>
-              {availableYears.map(y => (
-                <button key={y} className={`year-btn ${selectedYear === y ? 'active' : ''}`} onClick={() => setSelectedYear(y)}>{y}</button>
-              ))}
-            </div>
-          )}
-          <div className="dashboard-split">
-            <div className="cards-col">
-              <div className="card appear-1">
-                <div className="card-eyebrow">Total Purchases</div>
-                <div className="card-value">{formatCZK(totalPurchaseCZK)}</div>
-                <div className="card-sep" />
-                <div className="card-row"><span className="card-row-label">Tax exempt</span><span className="num-green">{formatCZK(exemptPurchaseCZK)}</span></div>
-                <div className="card-row"><span className="card-row-label">Taxable</span><span className="num-red">{formatCZK(taxablePurchaseCZK)}</span></div>
+          <div className="closed-workspace">
+            <header className="closed-workspace-header">
+              <div className="closed-workspace-titles">
+                <h2 className="closed-workspace-title">Closed positions</h2>
+                <p className="closed-workspace-meta">
+                  Czech koruna totals from your import, filtered by close date.
+                  {selectedYear ? (
+                    <> Showing <strong>{selectedYear}</strong> only.</>
+                  ) : (
+                    <> Select a <strong>year</strong> when more than one is available.</>
+                  )}
+                </p>
               </div>
-              <div className="card appear-2">
-                <div className="card-eyebrow">Total Sales</div>
-                <div className="card-value">{formatCZK(totalSaleCZK)}</div>
-                <div className="card-sep" />
-                <div className="card-row"><span className="card-row-label">Tax exempt</span><span className="num-green">{formatCZK(exemptSaleCZK)}</span></div>
-                <div className="card-row"><span className="card-row-label">Taxable</span><span className="num-red">{formatCZK(taxableSaleCZK)}</span></div>
-              </div>
-              <div className="card appear-3">
-                <div className="card-eyebrow">Tax Base</div>
-                <div className="card-value">{formatCZK(taxBase)}</div>
-                <div className="card-sep" />
-                <div className="card-row">
-                  <span className="card-row-label">Declare income?</span>
-                  <span className={`declare-pill ${mustDeclare ? 'pill-yes' : 'pill-no'}`}>{mustDeclare ? 'Yes' : 'No'}</span>
+              {availableYears.length > 0 && (
+                <div className="year-filter year-filter-inline" role="group" aria-label="Filter by year">
+                  <span className="year-label">Year</span>
+                  {availableYears.map(y => (
+                    <button key={y} type="button" className={`year-btn ${selectedYear === y ? 'active' : ''}`} onClick={() => setSelectedYear(y)}>{y}</button>
+                  ))}
                 </div>
-                <div className="card-row">
-                  <span className="card-row-label">Tax owed?</span>
-                  <span className={`declare-pill ${taxOwed ? 'pill-yes' : 'pill-no'}`}>{taxOwed ? 'Yes' : 'No'}</span>
-                </div>
-              </div>
-              <div className="card appear-3">
-                {(() => {
-                  const remaining = Math.max(0, taxablePurchaseCZK - taxableSaleCZK)
-                  const pct = taxablePurchaseCZK > 0 ? Math.min(100, (taxableSaleCZK / taxablePurchaseCZK) * 100) : 0
-                  const barColor = remaining <= 0 ? 'var(--red)' : pct >= 80 ? 'var(--amber)' : 'var(--green)'
-                  return (
-                    <>
-                      <div className="card-eyebrow">Sellable Budget</div>
-                      <div className="card-value" style={{ color: remaining <= 0 ? 'var(--red)' : 'var(--text-1)' }}>{formatCZK(remaining)}</div>
-                      <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: -12, marginBottom: 14 }}>
-                        before tax becomes due
-                      </div>
-                      <div style={{ height: 4, borderRadius: 99, background: 'rgba(255,255,255,0.06)', marginBottom: 14, overflow: 'hidden' }}>
-                        <div style={{ height: '100%', width: `${pct}%`, borderRadius: 99, background: barColor, transition: 'width 0.4s ease' }} />
-                      </div>
-                      <div className="card-sep" />
-                      <div className="card-row">
-                        <span className="card-row-label">Taxable sales</span>
-                        <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: barColor }}>{formatCZK(taxableSaleCZK)}</span>
-                      </div>
-                      <div className="card-row">
-                        <span className="card-row-label">Taxable purchases</span>
-                        <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-2)' }}>{formatCZK(taxablePurchaseCZK)}</span>
-                      </div>
-                    </>
-                  )
-                })()}
-              </div>
-            </div>
+              )}
+            </header>
 
-            <div className="pivot-shell appear-2">
-              <div className="pivot-topbar">
-                <div className="pivot-topbar-left">
-                  <span className="pivot-label">By Symbol</span>
-                  <span className="pivot-count">{symbolPivot.length}</span>
+            <div className="closed-dashboard-body">
+              <div className="closed-left-stack">
+                <div className="card appear-1">
+                  <div className="panel-header">
+                    <span className="panel-header-title">Tax position</span>
+                    <span className="panel-header-badge">{filteredRows.length} trades</span>
+                  </div>
+                  <div className="summary-dual">
+                    <div className="summary-dual-col">
+                      <div className="card-eyebrow">Purchases</div>
+                      <div className="card-value" style={{ fontSize: 20 }}>{formatCZK(totalPurchaseCZK)}</div>
+                      <div className="card-sep" />
+                      <div className="card-row"><span className="card-row-label">Exempt</span><span className="num-green">{formatCZK(exemptPurchaseCZK)}</span></div>
+                      <div className="card-row"><span className="card-row-label">Taxable</span><span className="num-red">{formatCZK(taxablePurchaseCZK)}</span></div>
+                    </div>
+                    <div className="summary-dual-rule" aria-hidden />
+                    <div className="summary-dual-col">
+                      <div className="card-eyebrow">Sales</div>
+                      <div className="card-value" style={{ fontSize: 20 }}>{formatCZK(totalSaleCZK)}</div>
+                      <div className="card-sep" />
+                      <div className="card-row"><span className="card-row-label">Exempt</span><span className="num-green">{formatCZK(exemptSaleCZK)}</span></div>
+                      <div className="card-row"><span className="card-row-label">Taxable</span><span className="num-red">{formatCZK(taxableSaleCZK)}</span></div>
+                    </div>
+                  </div>
+                  <div className="summary-outcome">
+                    <div className="card-eyebrow">Tax base (taxable)</div>
+                    <div className="card-value">{formatCZK(taxBase)}</div>
+                    <div className="card-sep" />
+                    <div className="card-row">
+                      <span className="card-row-label">Declare income</span>
+                      <span className={`declare-pill ${mustDeclare ? 'pill-yes' : 'pill-no'}`}>{mustDeclare ? 'Required' : 'Not required'}</span>
+                    </div>
+                    <div className="card-row">
+                      <span className="card-row-label">Tax on gains</span>
+                      <span className={`declare-pill ${taxOwed ? 'pill-yes' : 'pill-no'}`}>{taxOwed ? 'Owed' : 'None'}</span>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <div className="pivot-scroll">
-                <table className="pivot-table">
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th style={{ textAlign:'center' }}>Trades</th>
-                      <th>Taxable Buy</th>
-                      <th>Taxable Sell</th>
-                      <th>Tax Base</th>
-                      <th style={{ textAlign:'center' }}>Exempt</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {symbolPivot.map(s => {
-                      const taxBase = Math.max(0, s.taxableSaleCZK - s.taxablePurchaseCZK)
-                      const taxBaseClass = taxBase > 0 ? 'pnl-pos' : 'pnl-zero'
-                      return (
-                        <tr key={s.symbol}>
-                          <td>{s.symbol}</td>
-                          <td style={{ textAlign:'center', fontFamily:'var(--mono)', color:'var(--text-3)' }}>{s.trades}</td>
-                          <td className="num-red">{formatCZK(s.taxablePurchaseCZK)}</td>
-                          <td className="num-red">{formatCZK(s.taxableSaleCZK)}</td>
-                          <td className={taxBaseClass}>{taxBase > 0 ? '+' : ''}{formatCZK(taxBase)}</td>
-                          <td style={{ textAlign:'center', fontFamily:'var(--mono)', fontSize:11, color: s.exemptTrades > 0 ? 'var(--green)' : 'var(--text-3)' }}>{s.exemptTrades} / {s.trades}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
+
+              <div className="pivot-shell closed-pivot appear-2">
+                <div className="pivot-topbar">
+                  <div className="pivot-topbar-left" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span className="pivot-label">By symbol</span>
+                      <span className="pivot-count">{symbolPivot.length}</span>
+                    </div>
+                    <span className="pivot-sub">Taxable flows and per-symbol tax base for the same filter as above.</span>
+                  </div>
+                </div>
+                <div className="pivot-scroll">
+                  <table className="pivot-table">
+                    <thead>
+                      <tr>
+                        <th>Symbol</th>
+                        <th style={{ textAlign:'center' }}>Trades</th>
+                        <th>Taxable Buy</th>
+                        <th>Taxable Sell</th>
+                        <th>Tax Base</th>
+                        <th style={{ textAlign:'center' }}>Exempt</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {symbolPivot.map(s => {
+                        const rowTaxBase = Math.max(0, s.taxableSaleCZK - s.taxablePurchaseCZK)
+                        const taxBaseClass = rowTaxBase > 0 ? 'pnl-pos' : 'pnl-zero'
+                        return (
+                          <tr key={s.symbol}>
+                            <td>{s.symbol}</td>
+                            <td style={{ textAlign:'center', fontFamily:'var(--mono)', color:'var(--text-3)' }}>{s.trades}</td>
+                            <td className="num-red">{formatCZK(s.taxablePurchaseCZK)}</td>
+                            <td className="num-red">{formatCZK(s.taxableSaleCZK)}</td>
+                            <td className={taxBaseClass}>{rowTaxBase > 0 ? '+' : ''}{formatCZK(rowTaxBase)}</td>
+                            <td style={{ textAlign:'center', fontFamily:'var(--mono)', fontSize:11, color: s.exemptTrades > 0 ? 'var(--green)' : 'var(--text-3)' }}>{s.exemptTrades} / {s.trades}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>
@@ -1065,144 +1385,217 @@ export default function Home() {
                 </div>
               ) : (
                 <>
-                  {/* Card + symbol table side by side */}
-                  <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', marginBottom: 24 }}>
-                    <div className="card appear-1" style={{ minWidth: 220, flexShrink: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.04em', color: 'var(--text-1)', marginBottom: 14, paddingBottom: 10, borderBottom: '1px solid var(--border)' }}>Summary</div>
-                      <div className="card-sep" style={{ marginTop: 10 }} />
-                      <div style={{ marginBottom: 6 }}>
-                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Total purchase value</div>
-                        <div className="card-value" style={{ fontSize: 18, marginBottom: 0, textAlign: 'right' }}>{openRows.reduce((s, r) => s + Number(r['Purchase value'] ?? 0), 0).toFixed(2)} EUR</div>
-                      </div>
-                      <div className="card-sep" style={{ marginTop: 14 }} />
-                      <div style={{ marginBottom: 14 }}>
-                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Unrealised P/L</div>
-                        <div style={{ fontFamily: 'var(--mono)', fontSize: 15, fontWeight: 400, textAlign: 'right' }} className={openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0) >= 0 ? 'num-green' : 'num-red'}>
-                          {openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0) >= 0 ? '+' : ''}
-                          {openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0).toFixed(2)} EUR
-                        </div>
-                      </div>
-                      <div className="card-sep" />
-                      <div style={{ marginTop: 14 }}>
-                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Current value</div>
-                        <div className="card-value" style={{ fontSize: 18, marginBottom: 0, textAlign: 'right' }}>{openRows.reduce((s, r) => s + Number(r['Volume'] ?? 0) * Number(r['Market price'] ?? 0), 0).toFixed(2)} EUR</div>
-                      </div>
+                  <div className="open-workspace">
+                    <header className="open-workspace-header">
+                      <h2 className="open-workspace-title">Open book</h2>
+                      <p className="open-workspace-meta">
+                        Snapshot of live lines from your import. Headroom and sell limits use the same <strong>closed-trade year</strong> as the Closed Trades tab
+                        {selectedYear ? <> (<strong>{selectedYear}</strong>).</> : <> (pick a year there if several apply).</>}
+                      </p>
+                    </header>
+
+                    <div className="open-dash-grid">
+
+                      {/* ── Window 1: Portfolio ── */}
+                      {(() => {
+                        const totalPurchase = openRows.reduce((s, r) => s + Number(r['Purchase value'] ?? 0), 0)
+                        const totalPnl      = openRows.reduce((s, r) => s + Number(r['Gross P/L'] ?? 0), 0)
+                        const totalMtm      = openRows.reduce((s, r) => s + Number(r['Volume'] ?? 0) * Number(r['Market price'] ?? 0), 0)
+                        const pctPnl        = totalPurchase > 0 ? (totalPnl / totalPurchase) * 100 : 0
+                        const pnlPositive   = totalPnl >= 0
+                        return (
+                          <section className="open-dash-card open-dash-card--summary appear-1">
+                            <div className="open-dash-card-head">
+                              <div className="open-dash-head-left">
+                                <span className="open-dash-kicker">Portfolio</span>
+                                <span className="open-dash-head-title">Overview</span>
+                              </div>
+                              <span className="table-count">{openRows.length} positions</span>
+                            </div>
+                            <div className="open-dash-stat-stack">
+                              <div className="open-dash-stat">
+                                <span className="open-dash-stat-label">Cost basis (EUR)</span>
+                                <span className="open-dash-stat-value">{totalPurchase.toFixed(2)}</span>
+                              </div>
+                              <div className="open-dash-stat">
+                                <span className="open-dash-stat-label">Unrealised P/L (EUR)</span>
+                                <span className="open-dash-stat-value" style={{ color: pnlPositive ? 'var(--green)' : 'var(--red)' }}>
+                                  {pnlPositive ? '+' : ''}{totalPnl.toFixed(2)}
+                                </span>
+                              </div>
+                              <div className="open-dash-stat" style={{ borderBottom:'none' }}>
+                                <span className="open-dash-stat-label">Current value (EUR)</span>
+                                <span className="open-dash-stat-value">{totalMtm.toFixed(2)}</span>
+                              </div>
+                            </div>
+                          </section>
+                        )
+                      })()}
+
+                      {/* ── Window 2: By Symbol (P/L + tax status) ── */}
+                      {(() => {
+                        const symMap = new Map<string, { purchase: number; mtm: number; pnl: number; exempt: boolean; anyExempt: boolean }>()
+                        for (const r of openRows) {
+                          const sym = String(r['Symbol'] ?? '—')
+                          const purchase = Number(r['Purchase value'] ?? 0)
+                          const vol = Number(r['Volume'] ?? 0)
+                          const mp  = Number(r['Market price'] ?? 0)
+                          const pnl = Number(r['Gross P/L'] ?? 0)
+                          const exempt = r['Tax exempt'] === 'Yes'
+                          if (!symMap.has(sym)) symMap.set(sym, { purchase: 0, mtm: 0, pnl: 0, exempt: true, anyExempt: false })
+                          const e = symMap.get(sym)!
+                          e.purchase += purchase
+                          e.mtm     += vol * mp
+                          e.pnl     += pnl
+                          if (!exempt) e.exempt = false
+                          if (exempt)  e.anyExempt = true
+                        }
+                        const symbols = [...symMap.entries()].sort((a, b) => Math.abs(b[1].pnl) - Math.abs(a[1].pnl))
+                        return (
+                          <section className="open-dash-card open-dash-card--symbols appear-1">
+                            <div className="open-dash-card-head">
+                              <div className="open-dash-head-left">
+                                <span className="open-dash-kicker">Exposure</span>
+                                <span className="open-dash-head-title">By symbol</span>
+                              </div>
+                              <span className="table-count">{symbols.length}</span>
+                            </div>
+                            <div className="open-dash-scroll" style={{ overflow:'auto' }}>
+                              <table className="open-dash-table">
+                                <thead>
+                                  <tr>
+                                    <th style={{ textAlign:'left' }}>Symbol</th>
+                                    <th>Cost EUR</th>
+                                    <th>Current Value EUR</th>
+                                    <th>P/L EUR</th>
+                                    <th style={{ textAlign:'center' }}>Tax Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {symbols.map(([sym, { purchase, mtm, pnl, exempt, anyExempt }]) => {
+                                    const pos = pnl >= 0
+                                    const taxLabel = exempt ? 'Exempt' : anyExempt ? 'Partial' : 'Taxable'
+                                    const taxColor = exempt ? 'var(--green)' : anyExempt ? 'var(--amber)' : 'var(--text-3)'
+                                    return (
+                                      <tr key={sym}>
+                                        <td>{sym}</td>
+                                        <td>{purchase.toFixed(2)}</td>
+                                        <td>{mtm.toFixed(2)}</td>
+                                        <td className={pos ? 'num-green' : 'num-red'}>{pos ? '+' : ''}{pnl.toFixed(2)}</td>
+                                        <td style={{ color: taxColor, fontFamily:'Syne, sans-serif', fontSize:10, fontWeight:700, letterSpacing:'0.08em', textTransform:'uppercase', textAlign:'center' }}>{taxLabel}</td>
+                                      </tr>
+                                    )
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </section>
+                        )
+                      })()}
+
+                      {/* ── Window 3: Sell Budget ── */}
+                      {(() => {
+                        const remaining   = Math.max(0, taxablePurchaseCZK - taxableSaleCZK)
+                        const remainingEUR = todayFx > 0 ? remaining / todayFx : null
+                        const pct         = taxablePurchaseCZK > 0 ? Math.min(100, (taxableSaleCZK / taxablePurchaseCZK) * 100) : 0
+                        const barColor    = remaining <= 0 ? 'var(--red)' : pct >= 80 ? 'var(--amber)' : 'var(--green)'
+                        const fxOk        = todayFx > 0
+                        const badgeClass  = remaining <= 0 ? 'open-dash-badge--bad' : pct >= 80 ? 'open-dash-badge--warn' : 'open-dash-badge--ok'
+                        const badgeLabel  = remaining <= 0 ? 'No headroom' : pct >= 80 ? 'Tight' : 'Room left'
+                        let limitRows: { sym: string; maxSellCZK: number; maxSellVol: number; maxSellEUR: number; canSellAll: boolean }[] = []
+                        if (fxOk) {
+                          const symMap = new Map<string, { volume: number; marketPrice: number }>()
+                          for (const r of openRows) {
+                            const sym = String(r['Symbol'] ?? '—')
+                            if (!symMap.has(sym)) symMap.set(sym, { volume: 0, marketPrice: Number(r['Market price'] ?? 0) })
+                            symMap.get(sym)!.volume += Number(r['Volume'] ?? 0)
+                          }
+                          limitRows = [...symMap.entries()].map(([sym, { volume, marketPrice }]) => {
+                            const estFullCZK = volume * marketPrice * todayFx
+                            const maxSellCZK = Math.min(Math.max(remaining, 0), estFullCZK)
+                            const maxSellVol = marketPrice ? maxSellCZK / (marketPrice * todayFx) : 0
+                            const maxSellEUR = maxSellVol * marketPrice
+                            const canSellAll = estFullCZK <= remaining
+                            return { sym, maxSellCZK, maxSellVol, maxSellEUR, canSellAll }
+                          }).sort((a, b) => b.maxSellVol - a.maxSellVol)
+                        }
+                        return (
+                          <section className="open-dash-card open-dash-card--headroom appear-2">
+                            <div className="open-dash-card-head open-dash-card-head-tight">
+                              <div className="open-dash-head-left">
+                                <span className="open-dash-kicker">Sell Budget</span>
+                                <span className="open-dash-head-title">Tax headroom</span>
+                              </div>
+                              <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                                <span className={`open-dash-badge ${badgeClass}`}>{badgeLabel}</span>
+                                {fxOk && <span className="open-dash-fx">{todayFx.toFixed(3)} EUR/CZK</span>}
+                              </div>
+                            </div>
+                            <div className="open-dash-hr-body">
+                              <div className="open-dash-hr-kpis">
+                                <div>
+                                  <div className="open-dash-stat-label" style={{ marginBottom:4 }}>Sellable without owing tax</div>
+                                  <div className="open-dash-hr-hero-num" style={{ color: remaining <= 0 ? 'var(--red)' : 'var(--text-1)' }}>{formatCZK(remaining)}</div>
+                                  {remainingEUR !== null && (
+                                    <div className="open-dash-hr-hero-sub" style={{ color: remaining <= 0 ? 'var(--red)' : 'var(--text-2)' }}>≈ {remainingEUR.toFixed(2)} EUR</div>
+                                  )}
+                                  <div className="open-dash-hr-bar">
+                                    <div className="open-dash-hr-bar-fill" style={{ width:`${pct}%`, background:barColor }} />
+                                  </div>
+                                </div>
+                                <div className="open-dash-hr-side">
+                                  <div className="open-dash-hr-side-row">
+                                    <span className="open-dash-hr-side-label">Taxable sales</span>
+                                    <span className="open-dash-hr-side-val" style={{ color:barColor }}>{formatCZK(taxableSaleCZK)}</span>
+                                  </div>
+                                  <div className="open-dash-hr-side-row">
+                                    <span className="open-dash-hr-side-label">Taxable purchases</span>
+                                    <span className="open-dash-hr-side-val" style={{ color:'var(--text-2)' }}>{formatCZK(taxablePurchaseCZK)}</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {fxOk ? (
+                                <>
+                                  <div className="open-dash-hr-table-head">
+                                    <span className="open-dash-kicker" style={{ letterSpacing:'0.1em' }}>Per symbol</span>
+                                    <span className="table-count">{limitRows.length}</span>
+                                  </div>
+                                  <div className="open-dash-scroll" style={{ maxHeight:220 }}>
+                                    <table className="open-dash-table">
+                                      <thead>
+                                        <tr>
+                                          <th>Symbol</th>
+                                          <th>Max Vol</th>
+                                          <th>Max EUR</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {limitRows.map(({ sym, maxSellVol, maxSellEUR, canSellAll }) => (
+                                          <tr key={sym}>
+                                            <td>{sym}</td>
+                                            <td className={canSellAll ? 'num-green' : 'num-red'}>{maxSellVol.toFixed(4)}</td>
+                                            <td className={canSellAll ? 'num-green' : 'num-red'}>{maxSellEUR.toFixed(2)}</td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="open-dash-hint" style={{ margin:0 }}>
+                                  Waiting for today's CNB EUR/CZK rate — per-symbol limits will appear once the rate loads.
+                                </div>
+                              )}
+                            </div>
+                          </section>
+                        )
+                      })()}
                     </div>
-
-                  {/* Symbol summary — tax exempt volume */}
-                  {(() => {
-                    const symbolMap = new Map<string, { total: number; exempt: number }>()
-                    for (const r of openRows) {
-                      const sym = String(r['Symbol'] ?? '—')
-                      const vol = Number(r['Volume'] ?? 0)
-                      const exempt = r['Tax exempt'] === 'Yes'
-                      if (!symbolMap.has(sym)) symbolMap.set(sym, { total: 0, exempt: 0 })
-                      const e = symbolMap.get(sym)!
-                      e.total += vol
-                      if (exempt) e.exempt += vol
-                    }
-                    const symbols = [...symbolMap.entries()].sort((a, b) => b[1].total - a[1].total)
-                    return (
-                      <div className="table-shell appear-1" style={{ marginBottom: 24 }}>
-                        <div className="table-topbar">
-                          <div className="table-topbar-left">
-                            <span className="table-label">By Symbol</span>
-                            <span className="table-count">{symbols.length}</span>
-                          </div>
-                        </div>
-                        <table>
-                          <thead>
-                            <tr>
-                              <th style={{ textAlign: 'left' }}>Symbol</th>
-                              <th>Total Volume</th>
-                              <th>Not Exempt Volume</th>
-                              <th>Exempt Volume</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {symbols.map(([sym, { total, exempt }]) => {
-                              const notExempt = total - exempt
-                              const allExempt = notExempt < 0.0001
-                              return (
-                                <tr key={sym}>
-                                  <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{sym}</td>
-                                  <td>{total.toFixed(4)}</td>
-                                  <td className={notExempt > 0.0001 ? 'num-red' : 'pnl-zero'}>{notExempt > 0.0001 ? notExempt.toFixed(4) : '—'}</td>
-                                  <td className="num-green">{exempt > 0 ? exempt.toFixed(4) : '—'}</td>
-
-                                </tr>
-                              )
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    )
-                  })()}
-
-                  {/* ── What can I sell? dashboard ── */}
-                  {todayFx > 0 && (() => {
-                    const remaining = Math.max(0, taxablePurchaseCZK - taxableSaleCZK)
-                    // Build per-symbol summary from openRows
-                    const symMap = new Map<string, { volume: number; marketPrice: number }>()
-                    for (const r of openRows) {
-                      const sym = String(r['Symbol'] ?? '—')
-                      const vol = Number(r['Volume'] ?? 0)
-                      const mp  = Number(r['Market price'] ?? 0)
-                      if (!symMap.has(sym)) symMap.set(sym, { volume: 0, marketPrice: mp })
-                      symMap.get(sym)!.volume += vol
-                    }
-                    const symbols = [...symMap.entries()].map(([sym, { volume, marketPrice }]) => {
-                      const estFullCZK = volume * marketPrice * todayFx
-                      const maxSellCZK  = Math.min(Math.max(remaining, 0), estFullCZK)
-                      const maxSellVol  = todayFx && marketPrice ? maxSellCZK / (marketPrice * todayFx) : 0
-                      const canSellAll  = estFullCZK <= remaining
-                      return { sym, volume, marketPrice, maxSellCZK, maxSellVol, canSellAll }
-                    }).sort((a, b) => b.maxSellVol - a.maxSellVol)
-
-                    return (
-                      <div className="table-shell appear-2" style={{ marginBottom: 24 }}>
-                        <div className="table-topbar">
-                          <div className="table-topbar-left">
-                            <span className="table-label">What can I sell?</span>
-                            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: remaining > 0 ? 'var(--green)' : 'var(--red)', background: remaining > 0 ? 'rgba(61,224,176,0.08)' : 'rgba(255,128,144,0.08)', border: `1px solid ${remaining > 0 ? 'rgba(61,224,176,0.2)' : 'rgba(255,128,144,0.2)'}`, borderRadius: 4, padding: '2px 8px' }}>
-                              {remaining > 0 ? `${Math.round(remaining).toLocaleString('cs-CZ')} Kč available` : `No budget remaining`}
-                            </span>
-                          </div>
-                          {todayFx > 0 && (
-                            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
-                              EUR/CZK {todayFx.toFixed(3)} <span style={{ fontSize: 10 }}>ČNB today</span>
-                            </span>
-                          )}
-                        </div>
-                        <table>
-                          <thead>
-                            <tr>
-                              <th style={{ textAlign: 'left' }}>Symbol</th>
-                              <th>Total Volume</th>
-                              <th>Market Price</th>
-                              <th>Max Sellable Volume</th>
-                              <th>Max Sellable CZK</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {symbols.map(({ sym, volume, marketPrice, maxSellCZK, maxSellVol, canSellAll }) => (
-                              <tr key={sym}>
-                                <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{sym}</td>
-                                <td>{volume.toFixed(4)}</td>
-                                <td>{marketPrice.toFixed(4)}</td>
-                                <td className={canSellAll ? 'num-green' : 'num-red'}>{maxSellVol.toFixed(4)}</td>
-                                <td className={canSellAll ? 'num-green' : 'num-red'}>{Math.round(maxSellCZK).toLocaleString('cs-CZ')} Kč</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )
-                  })()}
                   </div>
 
                   {/* Open positions table */}
-                  <div className="table-shell appear-3">
+                  <div className="table-shell open-register-shell appear-3">
                     <div className="table-topbar">
                       <div className="table-topbar-left">
                         <span className="table-label">Open Positions</span>
@@ -1213,7 +1606,7 @@ export default function Home() {
                       <table>
                         <thead>
                           <tr>
-                            {[['Symbol','left'],['Type','right'],['Volume','right'],['Open Date','right'],['Days Held','right'],['Open Price','right'],['Market Price','right'],['Purchase EUR','right'],['Gross P/L','right'],['Tax Exempt','center'],['Days to Exempt','center']].map(([col, align]) => (
+                            {[['Symbol','left'],['Type','right'],['Volume','right'],['Open Date','right'],['Days Held','right'],['Open Price','right'],['Market Price','right'],['Purchase EUR','right'],['Gross P/L','right'],['% P/L','right'],['Tax Exempt','center'],['Days to Exempt','center']].map(([col, align]) => (
                               <th
                                 key={col}
                                 style={{ textAlign: align as any }}
@@ -1232,7 +1625,7 @@ export default function Home() {
                           {sortedOpenRows.map((r, i) => {
                             const pnl = Number(r['Gross P/L'] ?? 0)
                             const exempt = r['Tax exempt'] === 'Yes'
-                            const daysToExempt = Number(r['Days to exempt'] ?? 0)
+                            const daysToExempt = Number(r['Days to Exempt'] ?? 0)
                             return (
                               <tr key={i}>
                                 <td style={{ textAlign: 'left', fontFamily: 'Syne, sans-serif', fontWeight: 600, color: 'var(--text-1)' }}>{String(r['Symbol'] ?? '')}</td>
@@ -1244,6 +1637,7 @@ export default function Home() {
                                 <td>{String(r['Market price'] ?? '')}</td>
                                 <td>{String(r['Purchase value'] ?? '')}</td>
                                 <td style={{ color: pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</td>
+                                <td style={{ color: pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>{Number(r['_pctPL'] ?? 0) !== 0 || pnl === 0 ? (pnl >= 0 ? '+' : '') + Number(r['_pctPL'] ?? 0).toFixed(2) + '%' : '—'}</td>
                                 <td style={{ color: exempt ? 'var(--green)' : 'var(--red)', textAlign: 'center' }}>{r['Tax exempt'] ?? ''}</td>
                                 <td style={{ color: daysToExempt <= 180 && !exempt ? 'var(--amber)' : 'var(--text-3)', textAlign: 'center' }}>{exempt ? '—' : daysToExempt}</td>
                               </tr>
@@ -1260,11 +1654,14 @@ export default function Home() {
 
           {/* ── Trades table — shown in overview and closed views ── */}
           {activeView === 'overview' && (
-            <div className="table-shell appear-4">
+            <div className="table-shell closed-positions-shell appear-4">
               <div className="table-topbar">
-                <div className="table-topbar-left">
-                  <span className="table-label">Closed Positions</span>
-                  <span className="table-count">{filteredRows.length}</span>
+                <div className="table-topbar-left" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <span className="table-label">Trade register</span>
+                    <span className="table-count">{filteredRows.length}</span>
+                  </div>
+                  <span className="table-meta">Sortable detail for every closed line in the current year filter.</span>
                 </div>
                 <button className="export-btn" onClick={exportToExcel}>
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
